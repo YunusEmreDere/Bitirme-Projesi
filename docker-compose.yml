@@ -1,0 +1,13 @@
+# docker-compose.yml (Sadece Arayüz servisi)
+services:
+  #########################################
+  # 1. ARAYÜZ (React + Nginx)
+  # Bu servis, 'arauyuz' klasöründeki Dockerfile'ı bulur,
+  # React projenizi 'build' eder ve Nginx ile sunar.
+  #########################################
+  arayuz:
+    build:
+      context: ./web
+    container_name: web
+    ports:
+      - "8080:80" # Tarayıcıda http://localhost:8080 adresinden erişilir
