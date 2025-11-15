@@ -1,30 +1,11 @@
 import React, { useState } from 'react';
-// DİKKAT: Bu import yolunun (./css/Auth.module.css) dosya yapınızla
-// eşleştiğinden emin olun.
 import styles from './css/Auth.module.css';
 
 function Login({ onLoginSuccess, onSwitchToRegister }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-
-  const fakeApiLogin = (email, password) => {
-    return new Promise((resolve, reject) => {
-      setTimeout(() => {
-        if (email.toLowerCase() === 'test@proje.com' && password === '1234') {
-          resolve({ 
-            email: 'test@proje.com', 
-            name: 'Test Kullanıcısı',
-            avatarChar: 'T' 
-          });
-        } else {
-          reject(new Error('E-posta veya şifre hatalı.'));
-        }
-      }, 1500);
-    });
-  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -34,26 +15,56 @@ function Login({ onLoginSuccess, onSwitchToRegister }) {
       setError('Lütfen tüm alanları doldurun');
       return;
     }
-    setIsLoading(true); 
+
+    setIsLoading(true);
 
     try {
-      const user = await fakeApiLogin(email, password);
+      // Backend'e JSON gönder (yukarıdaki backend değişikliği ile uyumlu)
+      const response = await fetch('http://localhost:8000/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          username: email,  // veya email: email
+          password: password,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || 'Giriş yapılamadı.');
+      }
+      
+      // Başarılı giriş
+      const user = {
+        name: data.user_name,
+        email: data.user_email || email,
+        avatarChar: (data.user_name || 'U').charAt(0).toUpperCase()
+      };
+      
+      // Token'ı kaydet
+      localStorage.setItem('token', data.access_token);
+      localStorage.setItem('user', JSON.stringify(user));
+
       onLoginSuccess(user);
+
     } catch (apiError) {
-      setError(apiError.message);
+      console.error('Login error:', apiError);
+      if (apiError.message.includes('Failed to fetch')) {
+        setError('Bağlantı hatası: Backend servisi çalışmıyor olabilir.');
+      } else {
+        setError(apiError.message);
+      }
     } finally {
       setIsLoading(false);
     }
   };
 
-  // -----------------------------------------------------------------
-  // DÜZELTME BURADA BAŞLIYOR:
-  // Tüm 'className' öznitelikleri 'styles' objesini kullanacak şekilde güncellendi.
-  // -----------------------------------------------------------------
   return (
     <div className={styles.authBackground}>
       <div className={styles.authContainer}>
-        {/* Birden fazla sınıfı birleştirmek için template literal (backtick) kullanılır */}
         <div className={`${styles.authCard} ${styles.authCardSplit}`}>
           
           {/* LEFT PANEL */}
@@ -91,6 +102,7 @@ function Login({ onLoginSuccess, onSwitchToRegister }) {
                   onChange={(e) => setEmail(e.target.value)}
                   className={styles.authInput}
                   disabled={isLoading}
+                  autoComplete="email"
                 />
               </div>
 
@@ -103,6 +115,7 @@ function Login({ onLoginSuccess, onSwitchToRegister }) {
                   onChange={(e) => setPassword(e.target.value)}
                   className={styles.authInput}
                   disabled={isLoading}
+                  autoComplete="current-password"
                 />
               </div>
 

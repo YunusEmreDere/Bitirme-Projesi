@@ -1,0 +1,57 @@
+.tutorialContent {
+  text-align: center;
+  padding: 0.5rem;
+}
+
+.tutorialIcon {
+  font-size: 4rem;
+  margin-bottom: 1.5rem;
+  display: block;
+  animation: tutorialIconPop 0.5s ease-out;
+}
+
+@keyframes tutorialIconPop {
+  from {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.tutorialTitle {
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: white;
+  margin-bottom: 1rem;
+}
+
+.tutorialText {
+  font-size: 1rem;
+  color: rgba(255, 255, 255, 0.8);
+  line-height: 1.6;
+  margin-bottom: 2rem;
+  min-height: 50px; /* Adımlar arası geçişte kaymayı önler */
+}
+
+.stepIndicator {
+  display: flex;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-bottom: 2.5rem;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.2);
+  transition: all 0.3s ease;
+}
+
+.dot.activeDot {
+  background: #9333ea;
+  transform: scale(1.2);
+}

@@ -1,0 +1,90 @@
+/* src/css/Diff.module.css */
+
+.diffBlock {
+  margin: 1rem 0;
+  border-radius: 0.75rem;
+  overflow: hidden; /* İçindeki diff-viewer'ın taşmasını engeller */
+  background: #1e1e1e; /* Temel arka plan */
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+}
+
+.diffHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  background: rgba(0, 0, 0, 0.3);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.diffTitle {
+  color: #a78bfa; /* Mor tonu */
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+/* DiffViewer'ın kendi stillerini ezen/tamamlayan stiller */
+.diffContent :global(.diff-viewer) {
+  /* DiffViewer'ın ana container'ı */
+  border-radius: 0 0 0.75rem 0.75rem; /* Alt kenarları yuvarla */
+}
+
+/* Satır numaralarını ve içeriği saran divler */
+.diffContent :global(.diff-line) {
+  /* Satır yüksekliği */
+  line-height: 1.5em !important; 
+}
+
+/* Satır numarası (gutter) bölümü */
+.diffContent :global(.diff-gutter) {
+    background-color: #2a2a2a !important; /* Koyu arka plan */
+    color: #888 !important; /* Gri satır numarası */
+    padding-left: 10px !important;
+}
+
+/* İçerik bölümü */
+.diffContent :global(.diff-code-content) {
+    background-color: #1e1e1e !important; /* Koyu arka plan */
+    color: #ddd !important; /* Açık metin rengi */
+    padding-right: 10px !important;
+}
+
+/* Boş satırlar için arka plan */
+.diffContent :global(.diff-empty-line) {
+    background-color: #1e1e1e !important;
+}
+
+/* Eklenen satır arka planı (react-diff-viewer kendi stilini geçersiz kılabilir) */
+.diffContent :global(.diff-line.diff-added) {
+    background-color: rgba(76, 175, 80, 0.1) !important; /* Yeşil ton */
+}
+
+/* Silinen satır arka planı */
+.diffContent :global(.diff-line.diff-removed) {
+    background-color: rgba(244, 67, 54, 0.1) !important; /* Kırmızı ton */
+}
+
+/* Word (kelime bazında) eklenen farklar */
+.diffContent :global(.diff-word-added) {
+    background-color: rgba(76, 175, 80, 0.2) !important;
+    border-radius: 3px;
+    padding: 1px 3px;
+}
+
+/* Word (kelime bazında) silinen farklar */
+.diffContent :global(.diff-word-removed) {
+    background-color: rgba(244, 67, 54, 0.2) !important;
+    border-radius: 3px;
+    padding: 1px 3px;
+}
+
+/* Başlık blokları (Old, New) */
+.diffContent :global(.diff-title-block) {
+    background-color: rgba(0, 0, 0, 0.4) !important;
+    color: #fff !important;
+    font-weight: 600 !important;
+    font-size: 0.9em !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1) !important;
+}

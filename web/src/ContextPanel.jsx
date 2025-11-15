@@ -1,12 +1,17 @@
-// src/ContextPanel.jsx
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import Modal from './Modal';
-import contextStyles from './css/Context.module.css';
+// 'contextStyles' import'unuzun 'css' klasörü içinde olduğunu varsayıyorum
+import contextStyles from './css/Context.module.css'; 
 import modalStyles from './css/Modal.module.css';
 
-function ContextPanel({ onClose, contextFiles, onUpdateFiles }) {
+function ContextPanel({ onClose, contextFiles, basePath, onUpdateFiles }) {
   const [files, setFiles] = useState(contextFiles);
   const [newFile, setNewFile] = useState('');
+  const [projectBasePath, setProjectBasePath] = useState(basePath || '');
+
+  // --- DEĞİŞİKLİK 1: İki ayrı 'ref' ---
+  const folderInputRef = useRef(null); // Klasör seçici için
+  const fileInputRef = useRef(null);   // Dosya seçici için
 
   const addFile = () => {
     if (newFile.trim() && !files.includes(newFile.trim())) {
@@ -16,12 +21,46 @@ function ContextPanel({ onClose, contextFiles, onUpdateFiles }) {
     }
   };
 
+  // --- DEĞİŞİKLİK 2: Klasör seçme mantığı ---
+  const handleFolderSelect = (e) => {
+    const selectedFiles = Array.from(e.target.files);
+    if (selectedFiles.length === 0) return;
+
+    // Tüm dosyaların tam yollarını al (webkitRelativePath kullanarak)
+    const filePaths = selectedFiles.map(file => file.webkitRelativePath);
+
+    // Benzersiz dosya yollarını filtrele
+    const uniquePaths = filePaths.filter(path => !files.includes(path));
+
+    if (uniquePaths.length > 0) {
+      setFiles([...files, ...uniquePaths]);
+    }
+
+    // Input'u sıfırla
+    e.target.value = '';
+  };
+
+  // --- DEĞİŞİKLİK 3: (Eski) Dosya seçme mantığı ---
+  const handleFileSelect = (e) => {
+    const selectedFiles = Array.from(e.target.files);
+    // Artık 'webkitRelativePath' değil, sadece dosya adını alıyoruz
+    const fileNames = selectedFiles.map(file => file.name); 
+    
+    const newFiles = fileNames.filter(name => !files.includes(name));
+    if (newFiles.length > 0) {
+      setFiles([...files, ...newFiles]);
+    }
+    
+    e.target.value = '';
+  };
+
+
   const removeFile = (file) => {
     setFiles(files.filter(f => f !== file));
   };
 
   const handleSave = () => {
-    onUpdateFiles(files);
+    onUpdateFiles(files, projectBasePath);
     onClose();
   };
 
@@ -33,7 +72,8 @@ function ContextPanel({ onClose, contextFiles, onUpdateFiles }) {
   };
 
   return (
-    <Modal onClose={onClose}>
+    // 'cardClassName' prop'unu Modal'a iletiyoruz
+    <Modal onClose={onClose} cardClassName={modalStyles.modalCardLarge}>
       <div className={contextStyles.contextPanel}>
         <div className={contextStyles.header}>
           <h2>📁 Bağlam Dosyaları</h2>
@@ -43,12 +83,26 @@ function ContextPanel({ onClose, contextFiles, onUpdateFiles }) {
         </div>
 
         <div className={contextStyles.addFileSection}>
+          <label style={{ display: 'block', marginBottom: '8px', fontWeight: '600', color: '#333' }}>
+            🗂️ Proje Kök Dizini (Tam Yol):
+          </label>
+          <input
+            type="text"
+            value={projectBasePath}
+            onChange={(e) => setProjectBasePath(e.target.value)}
+            placeholder="örn: /home/kullanici/projelerim/proje-adi"
+            className={contextStyles.fileInput}
+            style={{ marginBottom: '16px' }}
+          />
+        </div>
+
+        <div className={contextStyles.addFileSection}>
           <input
             type="text"
             value={newFile}
             onChange={(e) => setNewFile(e.target.value)}
             onKeyPress={handleKeyPress}
-            placeholder="örn: main.py, utils.js, config.json"
+            placeholder="örn: src/main.py (manuel yol)"
             className={contextStyles.fileInput}
           />
           <button
@@ -56,7 +110,48 @@ function ContextPanel({ onClose, contextFiles, onUpdateFiles }) {
             className={contextStyles.addBtn}
             disabled={!newFile.trim()}
           >
-            + Ekle
+            ✍️ Ekle
+          </button>
+        </div>
+
+        <div className={contextStyles.orDivider}>
+          <span>veya</span>
+        </div>
+
+        {/* --- DEĞİŞİKLİK 4: İki ayrı gizli input --- */}
+        {/* Klasör Seçici */}
+        <input
+          ref={folderInputRef}
+          type="file"
+          multiple
+          webkitdirectory=""
+          mozdirectory=""
+          style={{ display: 'none' }}
+          onChange={handleFolderSelect}
+        />
+        {/* Dosya Seçici */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          onChange={handleFileSelect}
+          style={{ display: 'none' }}
+          accept=".py,.js,.jsx,.ts,.tsx,.json,.css,.html,.txt,.md,.java,.cpp,.c,.h"
+        />
+        
+        {/* --- DEĞİŞİKLİK 5: İki ayrı buton --- */}
+        <div className={contextStyles.buttonGroup}>
+          <button
+            onClick={() => folderInputRef.current?.click()}
+            className={contextStyles.selectFileBtn}
+          >
+            📁 Klasör Seç
+          </button>
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className={contextStyles.selectFileBtn}
+          >
+            📄 Dosya Seç
           </button>
         </div>
 
@@ -66,32 +161,43 @@ function ContextPanel({ onClose, contextFiles, onUpdateFiles }) {
               <span className={contextStyles.emptyIcon}>📂</span>
               <p>Henüz dosya eklenmedi</p>
               <p className={contextStyles.emptyHint}>
-                Yukarıdaki alandan dosya ekleyerek başlayın
+                Yukarıdan dosya veya klasör seçin
               </p>
             </div>
           ) : (
             <>
-              {files.map((file, index) => (
-                <div key={index} className={contextStyles.fileItem}>
-                  <div className={contextStyles.fileInfo}>
-                    <span className={contextStyles.fileIcon}>
-                      {file.endsWith('.py') ? '🐍' : 
-                       file.endsWith('.js') || file.endsWith('.jsx') ? '⚡' :
-                       file.endsWith('.json') ? '📋' :
-                       file.endsWith('.css') ? '🎨' :
-                       file.endsWith('.html') ? '🌐' : '📄'}
-                    </span>
-                    <span className={contextStyles.fileName}>{file}</span>
+              {files.map((item, index) => {
+                const getIcon = (fileName) => {
+                  if (fileName.endsWith('.py')) return '🐍';
+                  if (fileName.endsWith('.js') || fileName.endsWith('.jsx')) return '⚡';
+                  if (fileName.endsWith('.ts') || fileName.endsWith('.tsx')) return '💙';
+                  if (fileName.endsWith('.json')) return '📋';
+                  if (fileName.endsWith('.css')) return '🎨';
+                  if (fileName.endsWith('.html')) return '🌐';
+                  if (fileName.endsWith('.md')) return '📝';
+                  if (fileName.endsWith('.java')) return '☕';
+                  if (fileName.endsWith('.cpp') || fileName.endsWith('.c')) return '⚙️';
+                  return '📄';
+                };
+
+                return (
+                  <div key={index} className={contextStyles.fileItem}>
+                    <div className={contextStyles.fileInfo}>
+                      <span className={contextStyles.fileIcon}>
+                        {getIcon(item)}
+                      </span>
+                      <span className={contextStyles.fileName}>{item}</span>
+                    </div>
+                    <button
+                      onClick={() => removeFile(item)}
+                      className={contextStyles.removeBtn}
+                      title="Kaldır"
+                    >
+                      ✕
+                    </button>
                   </div>
-                  <button
-                    onClick={() => removeFile(file)}
-                    className={contextStyles.removeBtn}
-                    title="Dosyayı kaldır"
-                  >
-                    ✕
-                  </button>
-                </div>
-              ))}
+                );
+              })}
             </>
           )}
         </div>
@@ -99,8 +205,7 @@ function ContextPanel({ onClose, contextFiles, onUpdateFiles }) {
         <div className={contextStyles.infoBox}>
           <span className={contextStyles.infoIcon}>💡</span>
           <p>
-            Eklediğiniz dosyalar AI'nın çalışma bağlamını oluşturur. 
-            AI bu dosyalar hakkında bilgi sahibi olacak ve kod önerilerini buna göre yapacaktır.
+            Proje kök dizini: Dosyaların oluşturulacağı ana klasör. Klasör/dosya seçtiğinizde, yeni dosyalar bu dizin altında oluşturulur.
           </p>
         </div>
 
@@ -115,7 +220,7 @@ function ContextPanel({ onClose, contextFiles, onUpdateFiles }) {
             className={`${modalStyles.modalBtn} ${modalStyles.primary}`}
             onClick={handleSave}
           >
-            {files.length > 0 ? `Kaydet (${files.length} dosya)` : 'Kaydet'}
+            {files.length > 0 ? `Kaydet (${files.length} bağlam)` : 'Kaydet'}
           </button>
         </div>
       </div>

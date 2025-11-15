@@ -1,0 +1,46 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+backend-api
+
+# Test binary
+*.test
+
+# Output of go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# Environment variables
+.env
+.env.local
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Air (hot reload)
+tmp/
+
+# Logs
+*.log

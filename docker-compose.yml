@@ -1,13 +1,100 @@
-# docker-compose.yml (Sadece Arayüz servisi)
+version: '3.8'
+
 services:
   #########################################
   # 1. ARAYÜZ (React + Nginx)
-  # Bu servis, 'arauyuz' klasöründeki Dockerfile'ı bulur,
-  # React projenizi 'build' eder ve Nginx ile sunar.
   #########################################
   arayuz:
     build:
       context: ./web
     container_name: web
     ports:
-      - "8080:80" # Tarayıcıda http://localhost:8080 adresinden erişilir
+      - "8080:80"
+    depends_on:
+      - backend-api
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  #########################################
+  # 2. BACKEND API (Orkestratör)
+  #########################################
+  backend-api:
+    build:
+      context: ./backend-api
+    container_name: backend-api
+    user: "1000:1000"
+    ports:
+      - "8000:8000"
+    volumes:
+      # SQLite veritabanı
+      - ./backend-data:/app/data
+      # AI'nın yazacağı kodlar (eski sistem)
+      - ./kullanici-kodlari:/app/projects
+      # Kullanıcının home dizini (yeni sistem - özel proje yolları için)
+      - /home/yunus:/home/yunus
+    environment:
+      # Ollama servisi adresi (Docker internal)
+      - OLLAMA_API_URL=http://beyin-ollama:11434
+      # Database path
+      - DATABASE_URL=./data/veritabani.db
+      # JWT Secret (PRODUCTION'DA DEĞİŞTİRİN!)
+      - JWT_SECRET_KEY=BITIRME_PROJESI_COK_GIZLI_ANAHTARI_2025
+      # Projects path
+      - PROJECTS_PATH=/app/projects
+      # Gin mode (release/debug)
+      - GIN_MODE=release
+    depends_on:
+      beyin-ollama:
+        condition: service_started
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  #########################################
+  # 3. BEYİN (Ollama LLM Servisi)
+  #########################################
+  beyin-ollama:
+    image: ollama/ollama:latest
+    container_name: beyin-ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_MODELS=/root/.ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama-data:/root/.ollama
+    networks:
+      - app-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  backend-data:
+  ollama-data:
+  kullanici-kodlari:

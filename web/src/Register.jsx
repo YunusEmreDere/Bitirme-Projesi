@@ -1,3 +1,4 @@
+// src/Register.jsx
 import React, { useState } from 'react';
 import styles from './css/Auth.module.css';
 
@@ -6,27 +7,8 @@ function Register({ onRegisterSuccess, onSwitchToLogin }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
-  
-  // --- YENİ EKLENEN PROFESYONEL STATE'LER ---
   const [isLoading, setIsLoading] = useState(false);
-  // --- BİTTİ ---
 
-  // Sahte API çağrısını async/await ile simüle edelim
-  const fakeApiRegister = (name, email, password) => {
-    return new Promise((resolve, reject) => {
-      setTimeout(() => {
-        // Gerçekte burada backend'e istek atılır
-        // Şimdilik her kaydı başarılı kabul edelim
-        const user = { 
-          email: email, 
-          name: name,
-          avatarChar: name.charAt(0).toUpperCase()
-        };
-        resolve(user);
-      }, 1000); // 1 saniye gecikme
-    });
-  };
-  
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
@@ -41,20 +23,54 @@ function Register({ onRegisterSuccess, onSwitchToLogin }) {
       return;
     }
 
-    setIsLoading(true); // Yüklemeyi başlat
+    setIsLoading(true);
 
     try {
-      const user = await fakeApiRegister(fullName, email, password);
-      onRegisterSuccess(user); // Başarılı kayıt sonrası App.jsx'e haber ver
+      // Backend'e kayıt isteği gönder
+      const response = await fetch('http://localhost:8000/register', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: fullName,      // Backend'de "name" alanı bekleniyor
+          email: email,        // Backend'de "email" alanı bekleniyor
+          password: password,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || 'Kayıt yapılamadı.');
+      }
+      
+      // Başarılı kayıt
+      const user = {
+        name: data.user_name || fullName,
+        email: data.user_email || email,
+        avatarChar: (data.user_name || fullName).charAt(0).toUpperCase()
+      };
+      
+      // Token'ı kaydet
+      localStorage.setItem('token', data.access_token);
+      localStorage.setItem('user', JSON.stringify(user));
+
+      onRegisterSuccess(user);
+
     } catch (apiError) {
-      setError(apiError.message || 'Kayıt sırasında bir hata oluştu.');
+      console.error('Register error:', apiError);
+      if (apiError.message.includes('Failed to fetch')) {
+        setError('Bağlantı hatası: Backend servisi çalışmıyor olabilir.');
+      } else {
+        setError(apiError.message);
+      }
     } finally {
-      setIsLoading(false); // Yüklemeyi bitir
+      setIsLoading(false);
     }
   };
 
   return (
-    // 'className' özniteliklerini 'styles' objesiyle güncelliyoruz
     <div className={styles.authBackground}>
       <div className={styles.authContainer}>
         <div className={`${styles.authCard} ${styles.authCardSplit}`}>
@@ -95,7 +111,8 @@ function Register({ onRegisterSuccess, onSwitchToLogin }) {
                   value={fullName}
                   onChange={(e) => setFullName(e.target.value)}
                   className={styles.authInput}
-                  disabled={isLoading} // 'isLoading' state'i eklendi
+                  disabled={isLoading}
+                  autoComplete="name"
                 />
               </div>
 
@@ -107,7 +124,8 @@ function Register({ onRegisterSuccess, onSwitchToLogin }) {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   className={styles.authInput}
-                  disabled={isLoading} // 'isLoading' state'i eklendi
+                  disabled={isLoading}
+                  autoComplete="email"
                 />
               </div>
 
@@ -119,16 +137,16 @@ function Register({ onRegisterSuccess, onSwitchToLogin }) {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   className={styles.authInput}
-                  disabled={isLoading} // 'isLoading' state'i eklendi
+                  disabled={isLoading}
+                  autoComplete="new-password"
                 />
               </div>
 
               <button 
-                type="submit" // 'onClick' yerine form submit'i kullanılıyor
-                className={styles.authButton} 
-                disabled={isLoading} // 'isLoading' state'i eklendi
+                type="submit"
+                className={styles.authButton}
+                disabled={isLoading}
               >
-                {/* Buton metni 'isLoading' state'ine göre değişiyor */}
                 {isLoading ? 'Hesap Oluşturuluyor...' : 'Kayıt Ol'}
               </button>
             </form>
@@ -138,7 +156,7 @@ function Register({ onRegisterSuccess, onSwitchToLogin }) {
                 Zaten hesabınız var mı?{' '}
                 <span 
                   className={styles.authLink} 
-                  onClick={!isLoading ? onSwitchToLogin : null} // 'isLoading' state'i eklendi
+                  onClick={!isLoading ? onSwitchToLogin : null}
                 >
                   Giriş Yap
                 </span>

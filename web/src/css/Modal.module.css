@@ -276,3 +276,10 @@
   outline: 2px solid rgba(255, 255, 255, 0.5);
   outline-offset: 2px;
 }
+
+.modalBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}

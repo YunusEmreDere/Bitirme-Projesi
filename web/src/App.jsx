@@ -6,7 +6,7 @@ import Register from './Register';
 import ChatScreen from './ChatScreen';
 
 function App() {
-  const [currentScreen, setCurrentScreen] = useState('login'); // 'login', 'register', 'chat'
+  const [currentScreen, setCurrentScreen] = useState('login');
   const [currentUser, setCurrentUser] = useState(null);
 
   const handleLoginSuccess = (user) => {
@@ -25,31 +25,33 @@ function App() {
   };
 
   const switchToRegister = () => {
+    console.log("Kayıt ol ekranına geçiliyor...");
     setCurrentScreen('register');
   };
 
   const switchToLogin = () => {
+    console.log("Giriş ekranına geçiliyor...");
     setCurrentScreen('login');
   };
 
   return (
     <>
       {currentScreen === 'login' && (
-        <Login 
+        <Login
           onLoginSuccess={handleLoginSuccess}
           onSwitchToRegister={switchToRegister}
         />
       )}
 
       {currentScreen === 'register' && (
-        <Register 
+        <Register
           onRegisterSuccess={handleRegisterSuccess}
           onSwitchToLogin={switchToLogin}
         />
       )}
 
       {currentScreen === 'chat' && (
-        <ChatScreen 
+        <ChatScreen
           currentUser={currentUser}
           onLogout={handleLogout}
         />
