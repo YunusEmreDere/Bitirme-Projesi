@@ -1,0 +1,26 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Backend API metrikleri
+  - job_name: 'backend-api'
+    static_configs:
+      - targets: ['backend-api:8000']
+    metrics_path: '/metrics'
+
+  # cAdvisor - Container metrikleri (CPU, RAM, Network)
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+
+  # DCGM Exporter - GPU metrikleri (VRAM, sıcaklık, kullanım)
+  # NOT: GPU monitoring için docker compose --profile with-gpu up -d çalıştırın
+  # - job_name: 'dcgm'
+  #   static_configs:
+  #     - targets: ['dcgm-exporter:9400']
+
+  # Prometheus kendisi
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

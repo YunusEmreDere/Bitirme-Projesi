@@ -90,6 +90,93 @@ services:
       retries: 5
       start_period: 60s
 
+  #########################################
+  # 4. MONİTORİNG - Prometheus
+  #########################################
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  #########################################
+  # 5. MONİTORİNG - Grafana
+  #########################################
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  #########################################
+  # 6. MONİTORİNG - cAdvisor (CPU, RAM, Network)
+  #########################################
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    ports:
+      - "8081:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    devices:
+      - /dev/kmsg
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  #########################################
+  # 7. MONİTORİNG - DCGM Exporter (GPU VRAM, Sıcaklık)
+  # NOT: GPU varsa profiles'dan "with-gpu" seçin: docker compose --profile with-gpu up -d
+  #########################################
+  # dcgm-exporter:
+  #   image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.5-3.4.0-ubuntu22.04
+  #   container_name: dcgm-exporter
+  #   profiles:
+  #     - with-gpu
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   environment:
+  #     - NVIDIA_VISIBLE_DEVICES=all
+  #     - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+  #   ports:
+  #     - "9400:9400"
+  #   networks:
+  #     - app-network
+  #   restart: unless-stopped
+
 networks:
   app-network:
     driver: bridge
@@ -98,3 +185,5 @@ volumes:
   backend-data:
   ollama-data:
   kullanici-kodlari:
+  prometheus-data:
+  grafana-data:

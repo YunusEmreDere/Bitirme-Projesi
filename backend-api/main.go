@@ -15,6 +15,9 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -28,6 +31,53 @@ var (
 	OLLAMA_API_URL = getEnv("OLLAMA_API_URL", "http://beyin-ollama:11434")
 	DATABASE_URL   = getEnv("DATABASE_URL", "./data/veritabani.db")
 	PROJECTS_PATH  = getEnv("PROJECTS_PATH", "./projects")
+)
+
+// ----- PROMETHEUS METRİKLERİ -----
+var (
+	// Toplam /generate çağrısı sayısı
+	generateRequestsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "backend_generate_requests_total",
+		Help: "Toplam /generate endpoint çağrısı sayısı",
+	})
+
+	// Başarılı kod oluşturma sayısı
+	codeGenerationSuccess = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "backend_code_generation_success_total",
+		Help: "Başarılı kod oluşturma sayısı",
+	})
+
+	// Başarısız kod oluşturma sayısı
+	codeGenerationFailure = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "backend_code_generation_failure_total",
+		Help: "Başarısız kod oluşturma sayısı",
+	})
+
+	// Dosya oluşturma sayısı
+	filesCreatedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "backend_files_created_total",
+		Help: "Toplam oluşturulan dosya sayısı",
+	})
+
+	// Ollama API yanıt süresi
+	ollamaResponseDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "backend_ollama_response_duration_seconds",
+		Help:    "Ollama API yanıt süresi (saniye)",
+		Buckets: prometheus.DefBuckets,
+	})
+
+	// HTTP istek süresi
+	httpRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "backend_http_request_duration_seconds",
+		Help:    "HTTP istek süresi (saniye)",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"method", "endpoint", "status"})
+
+	// Aktif chat sayısı
+	activeChatsSummary = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "backend_active_chats_total",
+		Help: "Toplam aktif chat sayısı",
+	})
 )
 
 // getEnv, ortam değişkenini okur veya varsayılan bir değer döndürür
@@ -972,6 +1022,12 @@ func HandleFSMove(c *gin.Context) {
 
 // HandleGenerate: /api/generate endpoint'i (Ollama'ya bağlanan)
 func HandleGenerate(c *gin.Context) {
+	// Metrik: Toplam generate isteği sayısı
+	generateRequestsTotal.Inc()
+
+	// Zaman ölçümü başlat
+	startTime := time.Now()
+
 	userID := getUserID(c)
 	if userID == 0 {
 		c.JSON(http.StatusUnauthorized, gin.H{"detail": "Kullanıcı bulunamadı."})
@@ -1129,9 +1185,13 @@ const styles = StyleSheet.create({
 	})
 
 	// 'beyin-ollama' servisine HTTP isteği at
+	ollamaStartTime := time.Now()
 	resp, err := http.Post(OLLAMA_API_URL+"/api/generate", "application/json", bytes.NewBuffer(ollamaReqBody))
+	ollamaResponseDuration.Observe(time.Since(ollamaStartTime).Seconds())
+
 	if err != nil {
 		log.Printf("Ollama bağlantı hatası: %v", err)
+		codeGenerationFailure.Inc()
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Beyin (Ollama) servisine bağlanılamadı."})
 		return
 	}
@@ -1197,9 +1257,12 @@ const styles = StyleSheet.create({
 		if err := writeCodeToFile(req.ContextFiles, fileName, code, req.BasePath); err != nil {
 			log.Printf("❌ Dosya yazma hatası (%s): %v", fileName, err)
 			fileCreatedMsg = "\n\n⚠️ Dosya oluşturulamadı: " + err.Error()
+			codeGenerationFailure.Inc()
 		} else {
 			log.Printf("✅ Dosya başarıyla oluşturuldu: %s", targetPath)
 			fileCreatedMsg = "\n\n✅ Dosya oluşturuldu: " + targetPath
+			filesCreatedTotal.Inc()
+			codeGenerationSuccess.Inc()
 		}
 	} else {
 		log.Printf("ℹ️ Kod bloğu algılanmadı (botText length: %d)", len(botText))
@@ -1223,6 +1286,10 @@ const styles = StyleSheet.create({
 
 	// Chat'in güncelleme zamanını ayarla
 	db.Model(&chat).Update("updated_at", time.Now())
+
+	// Metrik: HTTP istek süresi
+	duration := time.Since(startTime).Seconds()
+	httpRequestDuration.WithLabelValues("POST", "/api/generate", "200").Observe(duration)
 
 	// Yanıtı döndür
 	c.JSON(http.StatusOK, MessageResponse{
@@ -1311,6 +1378,9 @@ func main() {
 	})
 
 	r.GET("/health", HandleHealthCheck)
+
+	// --- Prometheus Metrics (Herkese Açık) ---
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// --- Auth Rotaları (Herkese Açık) ---
 	r.POST("/register", HandleRegister)
