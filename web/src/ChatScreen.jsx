@@ -29,6 +29,7 @@ function ChatScreen({ currentUser = { name: 'Kullanıcı', email: '' }, onLogout
   const [contextFiles, setContextFiles] = useState(['main.py']);
   const [basePath, setBasePath] = useState('');
   const [showTutorial, setShowTutorial] = useState(false);
+  const [streamingMessage, setStreamingMessage] = useState(''); // WebSocket streaming için
 
   const [allChats, setAllChats] = useState([]);
 
@@ -88,6 +89,58 @@ function ChatScreen({ currentUser = { name: 'Kullanıcı', email: '' }, onLogout
       setShowTutorial(true);
     }
   }, []);
+
+  // currentChatId değiştiğinde mesajları yükle
+  useEffect(() => {
+    const loadMessages = async () => {
+      if (!currentChatId) return;
+
+      try {
+        const token = localStorage.getItem('token');
+        const response = await fetch(`http://localhost:8000/api/chats/${currentChatId}`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+          },
+        });
+
+        if (response.ok) {
+          const chatData = await response.json();
+
+          // Context bilgilerini parse et (backend'den JSON string geliyor)
+          let parsedContextFiles = [];
+          if (chatData.context_files) {
+            try {
+              parsedContextFiles = JSON.parse(chatData.context_files);
+            } catch (e) {
+              parsedContextFiles = [];
+            }
+          }
+
+          // Chat'i mesajları ve context'i ile birlikte güncelle
+          setAllChats(prevChats =>
+            prevChats.map(chat =>
+              chat.id === currentChatId
+                ? {
+                    ...chat,
+                    messages: chatData.Messages || [],
+                    context_files: chatData.context_files,
+                    base_path: chatData.base_path
+                  }
+                : chat
+            )
+          );
+
+          // Context state'lerini de güncelle
+          setContextFiles(parsedContextFiles.length > 0 ? parsedContextFiles : ['main.py']);
+          setBasePath(chatData.base_path || '');
+        }
+      } catch (error) {
+        console.error('Mesajlar yüklenirken hata:', error);
+      }
+    };
+
+    loadMessages();
+  }, [currentChatId]);
 
   // Scroll to bottom on messages change
   useEffect(() => {
@@ -238,51 +291,138 @@ function ChatScreen({ currentUser = { name: 'Kullanıcı', email: '' }, onLogout
   // ---------- sendMessageToBackend: Gerçek API ile bot cevabı ----------
   const sendMessageToBackend = async (text) => {
     setIsThinking(true);
+    setStreamingMessage(''); // Streaming mesajı sıfırla
 
     try {
-      // Backend'e istek at
       const token = localStorage.getItem('token');
-      const response = await fetch('http://localhost:8000/api/generate', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          prompt: text,
-          chat_id: currentChatId,
-          context_files: contextFiles,
-          base_path: basePath,
-        }),
-      });
 
-      const data = await response.json();
+      // WebSocket bağlantısı kur
+      const ws = new WebSocket(`ws://localhost:8000/api/generate/stream?token=${token}`);
 
-      if (!response.ok) {
-        throw new Error(data.detail || 'AI yanıt veremedi.');
-      }
-
-      // Backend'den gelen cevabı mesaj olarak ekle
-      const botResponse = {
-        type: data.type || 'text',
+      // Geçici bot mesajı ekle (streaming için)
+      const tempBotMessage = {
+        type: 'text',
         sender: 'bot',
-        text: data.text,
-        // Eğer diff ise:
-        oldValue: data.old_value,
-        newValue: data.new_value,
-        title: data.file_path || 'Değişiklik Önerisi',
+        text: '',
+        isStreaming: true,
       };
 
-      // Yeni mesajı mevcut chat'e ekle
       setAllChats(prevChats =>
         prevChats.map(chat =>
           chat.id === currentChatId
-            ? { ...chat, messages: [...chat.messages, botResponse], timestamp: new Date().toISOString() }
+            ? { ...chat, messages: [...chat.messages, tempBotMessage], timestamp: new Date().toISOString() }
             : chat
         )
       );
 
-      setIsThinking(false);
+      ws.onopen = () => {
+        console.log('✅ WebSocket bağlantısı kuruldu');
+
+        // İstek gönder
+        ws.send(JSON.stringify({
+          prompt: text,
+          chat_id: currentChatId,
+          context_files: contextFiles,
+          base_path: basePath,
+        }));
+      };
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.type === 'chunk') {
+          // Streaming chunk geldi - mesajı güncelle
+          setStreamingMessage(prev => prev + data.data);
+
+          // Chat'teki son mesajı (streaming mesaj) güncelle
+          setAllChats(prevChats =>
+            prevChats.map(chat => {
+              if (chat.id === currentChatId) {
+                const updatedMessages = [...chat.messages];
+                const lastIndex = updatedMessages.length - 1;
+                if (lastIndex >= 0 && updatedMessages[lastIndex].isStreaming) {
+                  updatedMessages[lastIndex] = {
+                    ...updatedMessages[lastIndex],
+                    text: updatedMessages[lastIndex].text + data.data,
+                  };
+                }
+                return { ...chat, messages: updatedMessages, timestamp: new Date().toISOString() };
+              }
+              return chat;
+            })
+          );
+
+        } else if (data.type === 'completed') {
+          // Streaming tamamlandı
+          console.log('✅ Streaming tamamlandı');
+
+          // Son mesajı tam veriyle güncelle
+          setAllChats(prevChats =>
+            prevChats.map(chat => {
+              if (chat.id === currentChatId) {
+                const updatedMessages = [...chat.messages];
+                const lastIndex = updatedMessages.length - 1;
+                if (lastIndex >= 0 && updatedMessages[lastIndex].isStreaming) {
+                  updatedMessages[lastIndex] = {
+                    type: data.message?.type || 'text',
+                    sender: 'bot',
+                    text: data.message?.text || updatedMessages[lastIndex].text,
+                    isStreaming: false,
+                    oldValue: data.message?.old_value,
+                    newValue: data.message?.new_value,
+                    title: data.message?.file_path || 'Değişiklik Önerisi',
+                  };
+                }
+                return { ...chat, messages: updatedMessages, timestamp: new Date().toISOString() };
+              }
+              return chat;
+            })
+          );
+
+          setStreamingMessage('');
+          setIsThinking(false);
+          ws.close();
+
+        } else if (data.error) {
+          // Hata geldi
+          throw new Error(data.error);
+        }
+      };
+
+      ws.onerror = (error) => {
+        console.error('❌ WebSocket hatası:', error);
+
+        const errorResponse = {
+          type: 'text',
+          sender: 'bot',
+          text: `❌ Hata: WebSocket bağlantısı başarısız.\n\nBackend servisi çalışıyor mu? (http://localhost:8000)`
+        };
+
+        setAllChats(prevChats =>
+          prevChats.map(chat => {
+            if (chat.id === currentChatId) {
+              const updatedMessages = [...chat.messages];
+              const lastIndex = updatedMessages.length - 1;
+              // Streaming mesajı varsa değiştir, yoksa ekle
+              if (lastIndex >= 0 && updatedMessages[lastIndex].isStreaming) {
+                updatedMessages[lastIndex] = errorResponse;
+              } else {
+                updatedMessages.push(errorResponse);
+              }
+              return { ...chat, messages: updatedMessages, timestamp: new Date().toISOString() };
+            }
+            return chat;
+          })
+        );
+
+        setStreamingMessage('');
+        setIsThinking(false);
+        ws.close();
+      };
+
+      ws.onclose = () => {
+        console.log('WebSocket bağlantısı kapandı');
+      };
 
     } catch (apiError) {
       console.error('AI Error:', apiError);
@@ -302,6 +442,7 @@ function ChatScreen({ currentUser = { name: 'Kullanıcı', email: '' }, onLogout
         )
       );
 
+      setStreamingMessage('');
       setIsThinking(false);
     }
   };
@@ -367,11 +508,32 @@ function ChatScreen({ currentUser = { name: 'Kullanıcı', email: '' }, onLogout
   };
 
   // Bağlam dosyaları güncelleme
-  const handleContextUpdate = (files, newBasePath) => {
+  const handleContextUpdate = async (files, newBasePath) => {
     setContextFiles(files);
     if (newBasePath !== undefined) {
       setBasePath(newBasePath);
     }
+
+    // Backend'e context bilgilerini kaydet
+    if (currentChatId) {
+      try {
+        const token = localStorage.getItem('token');
+        await fetch(`http://localhost:8000/api/chats/${currentChatId}/context`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            context_files: files,
+            base_path: newBasePath !== undefined ? newBasePath : basePath,
+          }),
+        });
+      } catch (error) {
+        console.error('Context kaydedilirken hata:', error);
+      }
+    }
+
     // Kullanıcıya bilgi mesajı
     const basePathMsg = newBasePath ? ` (Proje: ${newBasePath})` : '';
     handleSendMessageWithText(`(Bağlam güncellendi: ${files.join(', ')})${basePathMsg}`);

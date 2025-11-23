@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -31,6 +34,13 @@ var (
 	OLLAMA_API_URL = getEnv("OLLAMA_API_URL", "http://beyin-ollama:11434")
 	DATABASE_URL   = getEnv("DATABASE_URL", "./data/veritabani.db")
 	PROJECTS_PATH  = getEnv("PROJECTS_PATH", "./projects")
+
+	// WebSocket upgrader
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Production'da origin kontrolü yap
+		},
+	}
 )
 
 // ----- PROMETHEUS METRİKLERİ -----
@@ -100,12 +110,14 @@ type User struct {
 }
 
 type Chat struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	UserID    uint      `json:"user_id"`
-	Title     string    `json:"title"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Messages  []Message `json:"messages,omitempty" gorm:"foreignKey:ChatID"`
+	ID           uint      `gorm:"primaryKey" json:"id"`
+	UserID       uint      `json:"user_id"`
+	Title        string    `json:"title"`
+	ContextFiles string    `json:"context_files" gorm:"type:text"` // JSON array olarak saklanacak: ["file1.py", "file2.js"]
+	BasePath     string    `json:"base_path"`                      // Proje dizini
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Messages     []Message `json:"messages,omitempty" gorm:"foreignKey:ChatID"`
 }
 
 type Message struct {
@@ -243,6 +255,11 @@ type CreateChatRequest struct {
 	Title string `json:"title" binding:"required"`
 }
 
+type UpdateChatContextRequest struct {
+	ContextFiles []string `json:"context_files"`
+	BasePath     string   `json:"base_path"`
+}
+
 type MessageResponse struct {
 	ID        uint      `json:"id"`
 	Sender    string    `json:"sender"`
@@ -278,6 +295,37 @@ type FSDeleteRequest struct {
 type FSMoveRequest struct {
 	Source      string `json:"source" binding:"required"`
 	Destination string `json:"destination" binding:"required"`
+}
+
+type FSSearchRequest struct {
+	Path    string `json:"path" binding:"required"`
+	Pattern string `json:"pattern" binding:"required"` // Glob pattern: *.py, **/*.js
+}
+
+type FSGrepRequest struct {
+	Path    string `json:"path" binding:"required"`
+	Pattern string `json:"pattern" binding:"required"` // Regex pattern
+	Regex   bool   `json:"regex"`                      // True ise regex, false ise plain text
+}
+
+type ShellExecRequest struct {
+	Command string `json:"command" binding:"required"`
+	WorkDir string `json:"work_dir"` // Çalışma dizini (opsiyonel)
+	Timeout int    `json:"timeout"`  // Saniye cinsinden timeout (default: 30)
+}
+
+type ShellExecResponse struct {
+	Success  bool   `json:"success"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	ExitCode int    `json:"exit_code"`
+	Duration int64  `json:"duration"` // Millisaniye cinsinden
+}
+
+type GitOperationRequest struct {
+	Operation string            `json:"operation" binding:"required"` // status, diff, log, commit, add
+	WorkDir   string            `json:"work_dir" binding:"required"`
+	Args      map[string]string `json:"args"` // Operasyona özel argümanlar
 }
 
 type FileInfo struct {
@@ -502,6 +550,41 @@ func HandleDeleteChat(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Sohbet başarıyla silindi."})
 }
 
+// HandleUpdateChatContext: /api/chats/:id/context endpoint'i - Chat'in context bilgilerini günceller
+func HandleUpdateChatContext(c *gin.Context) {
+	userID := getUserID(c)
+	if userID == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"detail": "Kullanıcı bulunamadı."})
+		return
+	}
+
+	chatID := c.Param("id")
+	var chat Chat
+	if err := db.Where("id = ? AND user_id = ?", chatID, userID).First(&chat).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "Sohbet bulunamadı."})
+		return
+	}
+
+	var req UpdateChatContextRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Eksik veya hatalı alanlar."})
+		return
+	}
+
+	// ContextFiles'ı JSON string olarak sakla
+	contextFilesJSON, _ := json.Marshal(req.ContextFiles)
+	chat.ContextFiles = string(contextFilesJSON)
+	chat.BasePath = req.BasePath
+	chat.UpdatedAt = time.Now()
+
+	if err := db.Save(&chat).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Context güncellenirken hata oluştu."})
+		return
+	}
+
+	c.JSON(http.StatusOK, chat)
+}
+
 // readContextFiles, verilen dosya yollarındaki içerikleri okur
 func readContextFiles(files []string, basePath string) string {
 	var contextBuilder strings.Builder
@@ -580,24 +663,31 @@ func extractCodeBlock(text string) (code string, language string, hasCode bool) 
 	// FALLBACK: Markdown yoksa ama kod benzeri içerik varsa kabul et
 	trimmed := strings.TrimSpace(text)
 
+	// Markdown işaretlerini temizle (```python, ```, vb.)
+	cleanedText := trimmed
+	cleanedText = strings.ReplaceAll(cleanedText, "```python", "")
+	cleanedText = strings.ReplaceAll(cleanedText, "```react native", "")
+	cleanedText = strings.ReplaceAll(cleanedText, "```", "")
+	cleanedText = strings.TrimSpace(cleanedText)
+
 	// Python kodu algılama
-	if strings.Contains(trimmed, "print(") || strings.Contains(trimmed, "def ") ||
-	   strings.Contains(trimmed, "import ") || strings.Contains(trimmed, "class ") {
-		log.Printf("🔍 Markdown yok ama Python kodu algılandı")
-		return trimmed, "python", true
+	if strings.Contains(cleanedText, "print(") || strings.Contains(cleanedText, "def ") ||
+	   strings.Contains(cleanedText, "import ") || strings.Contains(cleanedText, "class ") {
+		log.Printf("🔍 Markdown yok ama Python kodu algılandı (FALLBACK)")
+		return cleanedText, "python", true
 	}
 
 	// JavaScript/React kodu algılama
-	if strings.Contains(trimmed, "function ") || strings.Contains(trimmed, "const ") ||
-	   strings.Contains(trimmed, "import React") || strings.Contains(trimmed, "export default") {
-		log.Printf("🔍 Markdown yok ama JavaScript kodu algılandı")
-		return trimmed, "javascript", true
+	if strings.Contains(cleanedText, "function ") || strings.Contains(cleanedText, "const ") ||
+	   strings.Contains(cleanedText, "import React") || strings.Contains(cleanedText, "export default") {
+		log.Printf("🔍 Markdown yok ama JavaScript kodu algılandı (FALLBACK)")
+		return cleanedText, "javascript", true
 	}
 
 	// Go kodu algılama
-	if strings.Contains(trimmed, "package ") || strings.Contains(trimmed, "func ") {
-		log.Printf("🔍 Markdown yok ama Go kodu algılandı")
-		return trimmed, "go", true
+	if strings.Contains(cleanedText, "package ") || strings.Contains(cleanedText, "func ") {
+		log.Printf("🔍 Markdown yok ama Go kodu algılandı (FALLBACK)")
+		return cleanedText, "go", true
 	}
 
 	log.Printf("❌ Hiçbir kod bloğu bulunamadı")
@@ -728,6 +818,139 @@ func writeCodeToFile(contextFiles []string, fileName string, code string, basePa
 
 	// Dosyayı yaz
 	return os.WriteFile(fullPath, []byte(code), 0644)
+}
+
+// parseAndExecuteTools, AI yanıtındaki tool çağrılarını parse edip çalıştırır
+func parseAndExecuteTools(aiResponse string, basePath string) string {
+	// 🔧 TOOL: ile başlayan satırları bul
+	lines := strings.Split(aiResponse, "\n")
+	var result strings.Builder
+	result.WriteString(aiResponse)
+	result.WriteString("\n\n--- TOOL EXECUTION RESULTS ---\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "🔧 TOOL:") {
+			continue
+		}
+
+		// Tool komutunu parse et
+		toolCmd := strings.TrimPrefix(line, "🔧 TOOL:")
+		toolCmd = strings.TrimSpace(toolCmd)
+
+		log.Printf("🔧 Tool komutu algılandı: %s", toolCmd)
+
+		// Shell komutu
+		if strings.HasPrefix(toolCmd, "Shell -") {
+			cmd := strings.TrimPrefix(toolCmd, "Shell -")
+			cmd = strings.TrimSpace(cmd)
+			if strings.HasPrefix(cmd, "komut:") {
+				cmd = strings.TrimPrefix(cmd, "komut:")
+				cmd = strings.TrimSpace(cmd)
+			}
+
+			log.Printf("🔧 Shell komutu çalıştırılıyor: %s", cmd)
+			output := executeShellCommand(cmd, basePath)
+			result.WriteString(fmt.Sprintf("\n✅ Shell: %s\n%s\n", cmd, output))
+		}
+
+		// Dosya okuma
+		if strings.Contains(toolCmd, "Dosya okuma") {
+			// "Dosya okuma isteği - /path/to/file" formatı
+			parts := strings.Split(toolCmd, "-")
+			if len(parts) >= 2 {
+				filePath := strings.TrimSpace(parts[len(parts)-1])
+				log.Printf("🔧 Dosya okunuyor: %s", filePath)
+				content := readFile(filePath, basePath)
+				result.WriteString(fmt.Sprintf("\n✅ Dosya: %s\n%s\n", filePath, content))
+			}
+		}
+
+		// Git işlemleri
+		if strings.HasPrefix(toolCmd, "Git ") {
+			gitOp := strings.TrimPrefix(toolCmd, "Git ")
+			gitOp = strings.TrimSpace(gitOp)
+			log.Printf("🔧 Git komutu: %s", gitOp)
+			output := executeGitCommand(gitOp, basePath)
+			result.WriteString(fmt.Sprintf("\n✅ Git %s:\n%s\n", gitOp, output))
+		}
+	}
+
+	return result.String()
+}
+
+// executeShellCommand, shell komutu çalıştırır
+func executeShellCommand(command string, workDir string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Sprintf("❌ Hata: %v\nStderr: %s", err, stderr.String())
+	}
+
+	return stdout.String()
+}
+
+// readFile, dosya okur
+func readFile(filePath string, basePath string) string {
+	fullPath := filepath.Join(basePath, filePath)
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		return fmt.Sprintf("❌ Dosya okunamadı: %v", err)
+	}
+	return string(content)
+}
+
+// executeGitCommand, git komutu çalıştırır
+func executeGitCommand(operation string, workDir string) string {
+	var cmd *exec.Cmd
+
+	// "commit -m 'message'" gibi komutları parse et
+	if strings.HasPrefix(operation, "commit") {
+		parts := strings.SplitN(operation, "'", 3)
+		if len(parts) >= 2 {
+			message := strings.Trim(parts[1], "'\"")
+			cmd = exec.Command("git", "commit", "-m", message)
+		}
+	} else if operation == "status" {
+		cmd = exec.Command("git", "status", "--porcelain")
+	} else if operation == "diff" {
+		cmd = exec.Command("git", "diff")
+	} else if strings.HasPrefix(operation, "add") {
+		files := strings.TrimPrefix(operation, "add")
+		files = strings.TrimSpace(files)
+		if files == "" {
+			files = "."
+		}
+		cmd = exec.Command("git", "add", files)
+	} else {
+		return fmt.Sprintf("❌ Bilinmeyen git operasyonu: %s", operation)
+	}
+
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Sprintf("❌ Git hatası: %v\nStderr: %s", err, stderr.String())
+	}
+
+	return stdout.String()
 }
 
 // detectMessageType, bot yanıtının tipini belirler (text, code, diff)
@@ -1020,6 +1243,274 @@ func HandleFSMove(c *gin.Context) {
 	})
 }
 
+// HandleFSSearch: /api/tools/fs/search - Glob pattern ile dosya arama
+func HandleFSSearch(c *gin.Context) {
+	userID := getUserID(c)
+	if userID == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"detail": "Kullanıcı bulunamadı."})
+		return
+	}
+
+	var req FSSearchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Eksik veya hatalı istek."})
+		return
+	}
+
+	// Güvenlik kontrolü
+	basePath, err := validatePath(req.Path)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"detail": "Erişim reddedildi."})
+		return
+	}
+
+	// Glob pattern uygula
+	pattern := filepath.Join(basePath, req.Pattern)
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Geçersiz pattern."})
+		return
+	}
+
+	var files []FileInfo
+	for _, match := range matches {
+		info, err := os.Stat(match)
+		if err != nil {
+			continue
+		}
+
+		files = append(files, FileInfo{
+			Name:    info.Name(),
+			Path:    match,
+			IsDir:   info.IsDir(),
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+		})
+	}
+
+	c.JSON(http.StatusOK, FSListResponse{
+		Files: files,
+		Total: len(files),
+	})
+}
+
+// HandleFSGrep: /api/tools/fs/grep - Dosya içeriğinde arama
+func HandleFSGrep(c *gin.Context) {
+	userID := getUserID(c)
+	if userID == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"detail": "Kullanıcı bulunamadı."})
+		return
+	}
+
+	var req FSGrepRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Eksik veya hatalı istek."})
+		return
+	}
+
+	// Güvenlik kontrolü
+	fullPath, err := validatePath(req.Path)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"detail": "Erişim reddedildi."})
+		return
+	}
+
+	// Dosya oku
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "Dosya okunamadı."})
+		return
+	}
+
+	// Satır satır ara
+	lines := strings.Split(string(content), "\n")
+	type Match struct {
+		Line   int    `json:"line"`
+		Text   string `json:"text"`
+		Column int    `json:"column"`
+	}
+	var matches []Match
+
+	if req.Regex {
+		// Regex arama
+		re, err := regexp.Compile(req.Pattern)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "Geçersiz regex pattern."})
+			return
+		}
+
+		for i, line := range lines {
+			if loc := re.FindStringIndex(line); loc != nil {
+				matches = append(matches, Match{
+					Line:   i + 1,
+					Text:   line,
+					Column: loc[0],
+				})
+			}
+		}
+	} else {
+		// Plain text arama
+		for i, line := range lines {
+			if idx := strings.Index(line, req.Pattern); idx != -1 {
+				matches = append(matches, Match{
+					Line:   i + 1,
+					Text:   line,
+					Column: idx,
+				})
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"matches": matches,
+		"total":   len(matches),
+		"file":    req.Path,
+	})
+}
+
+// HandleShellExec: /api/tools/shell/exec - Güvenli shell command execution
+func HandleShellExec(c *gin.Context) {
+	userID := getUserID(c)
+	if userID == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"detail": "Kullanıcı bulunamadı."})
+		return
+	}
+
+	var req ShellExecRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Eksik veya hatalı istek."})
+		return
+	}
+
+	// Timeout default değeri
+	if req.Timeout == 0 {
+		req.Timeout = 30
+	}
+	if req.Timeout > 300 {
+		req.Timeout = 300 // Max 5 dakika
+	}
+
+	// WorkDir güvenlik kontrolü
+	var workDir string
+	if req.WorkDir != "" {
+		var err error
+		workDir, err = validatePath(req.WorkDir)
+		if err != nil {
+			c.JSON(http.StatusForbidden, gin.H{"detail": "Çalışma dizini erişim reddedildi."})
+			return
+		}
+	}
+
+	// Komut çalıştır
+	startTime := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.Timeout)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", req.Command)
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	duration := time.Since(startTime).Milliseconds()
+
+	exitCode := 0
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			exitCode = exitError.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	c.JSON(http.StatusOK, ShellExecResponse{
+		Success:  exitCode == 0,
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		ExitCode: exitCode,
+		Duration: duration,
+	})
+}
+
+// HandleGitOperation: /api/tools/git/* - Git operasyonları
+func HandleGitOperation(c *gin.Context) {
+	userID := getUserID(c)
+	if userID == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"detail": "Kullanıcı bulunamadı."})
+		return
+	}
+
+	var req GitOperationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Eksik veya hatalı istek."})
+		return
+	}
+
+	// WorkDir güvenlik kontrolü
+	workDir, err := validatePath(req.WorkDir)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"detail": "Çalışma dizini erişim reddedildi."})
+		return
+	}
+
+	var cmd *exec.Cmd
+	switch req.Operation {
+	case "status":
+		cmd = exec.Command("git", "status", "--porcelain")
+	case "diff":
+		cmd = exec.Command("git", "diff")
+	case "log":
+		limit := req.Args["limit"]
+		if limit == "" {
+			limit = "10"
+		}
+		cmd = exec.Command("git", "log", "--oneline", "-n", limit)
+	case "add":
+		files := req.Args["files"]
+		if files == "" {
+			files = "."
+		}
+		cmd = exec.Command("git", "add", files)
+	case "commit":
+		message := req.Args["message"]
+		if message == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "Commit mesajı gerekli."})
+			return
+		}
+		cmd = exec.Command("git", "commit", "-m", message)
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Geçersiz git operasyonu."})
+		return
+	}
+
+	cmd.Dir = workDir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err = cmd.Run()
+	exitCode := 0
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			exitCode = exitError.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":   exitCode == 0,
+		"stdout":    stdout.String(),
+		"stderr":    stderr.String(),
+		"exit_code": exitCode,
+		"operation": req.Operation,
+	})
+}
+
 // HandleGenerate: /api/generate endpoint'i (Ollama'ya bağlanan)
 func HandleGenerate(c *gin.Context) {
 	// Metrik: Toplam generate isteği sayısı
@@ -1080,6 +1571,52 @@ func HandleGenerate(c *gin.Context) {
 3. Kullanıcı kod istediğinde SADECE KOD yaz, açıklama yapma.
 4. Kullanıcı açıklama isterse o zaman Türkçe açıklama yap.
 5. Tüm kod bloklarını markdown formatında yaz: ` + "```python" + `, ` + "```javascript" + `, ` + "```go" + ` gibi.
+
+DÜŞÜNME VE PROBLEM ÇÖZME SÜRECİ:
+Karmaşık sorunlarla karşılaştığında veya kullanıcı bir hata bildirdiğinde, aşamalı düşün:
+
+1. DURUMU ANALİZ ET:
+   - "Hata şu: [hata mesajı]"
+   - "Sorun şurada görünüyor: [dosya/satır]"
+   - "Kontrol edelim: [ne kontrol edileceği]"
+
+2. ADIM ADIM İNCELE:
+   - "Önce [X]'i kontrol edelim"
+   - "Şimdi [Y]'ye bakalım"
+   - "Son olarak [Z]'yi doğrulayalım"
+
+3. KÖK SEBEBİ BUL:
+   - "Aha! Sorun göründü: [kök sebep]"
+   - "Problem şu: [açıklama]"
+
+4. ÇÖZÜMÜ PLANLA:
+   - "Bunu şöyle çözelim: [çözüm planı]"
+   - "Yapılacaklar: 1) [adım1], 2) [adım2]"
+
+5. UYGULA VE DOĞRULA:
+   - Kodu yaz
+   - "Bu çözüm [neden] işe yarayacak"
+
+ÖRNEK DÜŞÜNME SÜRECİ:
+Kullanıcı: "WebSocket bağlantısı başarısız oluyor"
+Sen:
+"WebSocket bağlantısı başarısız. Önce backend loglarına bakalım:
+
+🔍 Backend'de şu hatayı görüyorum: 401 Unauthorized /api/generate/stream
+
+Aha! Sorun göründü: WebSocket endpoint'i JWT middleware içinde ve token query string'den alınmıyor.
+
+Çözüm: Endpoint'i middleware dışına taşımalıyız. Şöyle düzeltelim:
+` + "```go" + `
+// WebSocket endpoint (middleware dışında)
+r.GET(\"/api/generate/stream\", HandleGenerateStream)
+
+// Diğer API endpoint'leri (middleware içinde)
+api := r.Group(\"/api\")
+api.Use(AuthMiddleware())
+` + "```" + `
+
+Bu çözüm işe yarayacak çünkü WebSocket token'ı query string'den alıyor."
 
 DOSYA İŞLEMLERİ:
 Kullanıcı "dosya oluştur", "dosyaya ekle", "şunu değiştir", "bu satırı sil" gibi komutlar verdiğinde:
@@ -1166,7 +1703,55 @@ const styles = StyleSheet.create({
 - Gereksiz açıklama yapma
 - Sadece diff + kod bloğu yaz
 - Context files'da dosya varsa mutlaka diff formatı kullan
-- Dosya yoksa direkt kod bloğu yaz`
+- Dosya yoksa direkt kod bloğu yaz
+
+GELIŞMIŞ YETKİLER - TOOL KULLANIMI:
+Sen sadece kod yazan bir asistan değilsin. Aynı zamanda dosya sistemi, terminal ve git işlemlerini de yapabilirsin!
+
+KULLANILABILIR TOOL'LAR:
+
+1. DOSYA OKUMA:
+   Backend'den dosya içeriğini isteyebilirsin. Örnek:
+   "🔧 TOOL: Dosya okuma isteği - /path/to/file.py"
+
+2. DOSYA ARAMA:
+   Glob pattern ile dosya bul:
+   "🔧 TOOL: Dosya arama - pattern: **/*.test.js"
+
+3. İÇERİK ARAMA (GREP):
+   Dosyalarda text/regex ara:
+   "🔧 TOOL: Grep - dosya: app.py, pattern: 'def login'"
+
+4. SHELL KOMUTU:
+   Terminal komutları çalıştır:
+   "🔧 TOOL: Shell - komut: pytest tests/ -v"
+   "🔧 TOOL: Shell - komut: npm run build"
+
+5. GIT İŞLEMLERİ:
+   "🔧 TOOL: Git status"
+   "🔧 TOOL: Git diff"
+   "🔧 TOOL: Git commit -m 'fix: bug düzeltildi'"
+
+TOOL KULLANIM STRATEJİSİ:
+
+Kullanıcı hata bildirdiğinde veya debug istediğinde:
+1. Önce ilgili dosyayı OKU: "🔧 TOOL: Dosya okuma - app.py"
+2. Hata varsa çöz ve kodu yaz
+3. Test çalıştır: "🔧 TOOL: Shell - pytest tests/"
+4. Başarılıysa commit: "🔧 TOOL: Git commit -m 'fix: hata düzeltildi'"
+
+Kullanıcı "testi çalıştır" dediğinde:
+1. Test komutunu çalıştır: "🔧 TOOL: Shell - npm test"
+2. Hata varsa analiz et ve düzelt
+3. Tekrar test et
+4. Başarılı olana kadar devam et
+
+Kullanıcı "kod bul" dediğinde:
+1. İlk olarak dosya ara: "🔧 TOOL: Dosya arama - **/*login*"
+2. Bulamazsan içerik ara: "🔧 TOOL: Grep - pattern: 'login'"
+3. Bulduğun dosyayı oku ve analiz et
+
+NOT: Tool kullanımını her zaman "🔧 TOOL:" öneki ile başlat ki backend tanısın!`
 
 	if contextContent != "" {
 		systemPrompt += "\n\nContext files:\n" + contextContent
@@ -1223,6 +1808,12 @@ const styles = StyleSheet.create({
 			c.JSON(http.StatusInternalServerError, gin.H{"detail": "Beyin (Ollama) servisinden geçersiz yanıt alındı."})
 		}
 		return
+	}
+
+	// 🔧 TOOL EXECUTION: AI'nın yanıtındaki tool çağrılarını parse et ve çalıştır
+	if strings.Contains(botText, "🔧 TOOL:") {
+		log.Printf("🔧 Tool çağrıları algılandı, parse ediliyor...")
+		botText = parseAndExecuteTools(botText, req.BasePath)
 	}
 
 	// Kod bloğu varsa otomatik olarak dosyaya yaz
@@ -1298,6 +1889,323 @@ const styles = StyleSheet.create({
 		Type:      botMessage.Type,
 		Text:      botMessage.Text,
 		CreatedAt: botMessage.CreatedAt,
+	})
+}
+
+// HandleGenerateStream: WebSocket üzerinden streaming yanıt veren endpoint
+func HandleGenerateStream(c *gin.Context) {
+	// Metrik: Toplam generate isteği
+	generateRequestsTotal.Inc()
+
+	// WebSocket bağlantısını upgrade et
+	ws, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Printf("❌ WebSocket upgrade hatası: %v", err)
+		return
+	}
+	defer ws.Close()
+
+	// İlk mesajı al (GenerateRequest)
+	var req GenerateRequest
+	if err := ws.ReadJSON(&req); err != nil {
+		log.Printf("❌ WebSocket mesaj okuma hatası: %v", err)
+		ws.WriteJSON(map[string]string{"error": "Geçersiz istek formatı"})
+		return
+	}
+
+	// JWT token'dan user ID'yi al
+	tokenString := c.Query("token")
+	if tokenString == "" {
+		ws.WriteJSON(map[string]string{"error": "Token bulunamadı"})
+		return
+	}
+
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		return JWT_SECRET_KEY, nil
+	})
+
+	if err != nil || !token.Valid {
+		ws.WriteJSON(map[string]string{"error": "Geçersiz token"})
+		return
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		ws.WriteJSON(map[string]string{"error": "Token claims alınamadı"})
+		return
+	}
+
+	userID := uint(claims["user_id"].(float64))
+
+	// Sohbetin kullanıcıya ait olduğunu doğrula
+	var chat Chat
+	if err := db.Where("id = ? AND user_id = ?", req.ChatID, userID).First(&chat).Error; err != nil {
+		ws.WriteJSON(map[string]string{"error": "Bu sohbete erişim yetkiniz yok"})
+		return
+	}
+
+	// Kullanıcı mesajını kaydet
+	userMessage := Message{
+		ChatID:    req.ChatID,
+		Sender:    "user",
+		Text:      req.Prompt,
+		Type:      "text",
+		CreatedAt: time.Now(),
+	}
+	if err := db.Create(&userMessage).Error; err != nil {
+		ws.WriteJSON(map[string]string{"error": "Mesaj kaydedilemedi"})
+		return
+	}
+
+	// Context dosyalarını oku
+	contextContent := ""
+	if len(req.ContextFiles) > 0 {
+		contextContent = readContextFiles(req.ContextFiles, req.BasePath)
+	}
+
+	// System prompt
+	systemPrompt := `Sen Türkçe konuşan bir akıllı kod asistanısın. Kullanıcılar sesli komutlarla senden kod yazmanı, dosya oluşturmanı, dosyaları düzenlemenı isteyecek.
+
+ÖNEMLİ KURALLAR:
+1. HER ZAMAN TÜRKÇE KONUŞ. İngilizce cevap verme.
+2. Gereksiz konuşma yapma. "Tamam", "İşte kod", "Merhaba" gibi ifadeler yasak.
+3. Kullanıcı kod istediğinde SADECE KOD yaz, açıklama yapma.
+4. Kullanıcı açıklama isterse o zaman Türkçe açıklama yap.
+5. Tüm kod bloklarını markdown formatında yaz: ` + "```python" + `, ` + "```javascript" + `, ` + "```go" + ` gibi.
+
+DÜŞÜNME VE PROBLEM ÇÖZME SÜRECİ:
+Karmaşık sorunlarla karşılaştığında veya kullanıcı bir hata bildirdiğinde, aşamalı düşün:
+
+1. DURUMU ANALİZ ET:
+   - "Hata şu: [hata mesajı]"
+   - "Sorun şurada görünüyor: [dosya/satır]"
+   - "Kontrol edelim: [ne kontrol edileceği]"
+
+2. ADIM ADIM İNCELE:
+   - "Önce [X]'i kontrol edelim"
+   - "Şimdi [Y]'ye bakalım"
+   - "Son olarak [Z]'yi doğrulayalım"
+
+3. KÖK SEBEBİ BUL:
+   - "Aha! Sorun göründü: [kök sebep]"
+   - "Problem şu: [açıklama]"
+
+4. ÇÖZÜMÜ PLANLA:
+   - "Bunu şöyle çözelim: [çözüm planı]"
+   - "Yapılacaklar: 1) [adım1], 2) [adım2]"
+
+5. UYGULA VE DOĞRULA:
+   - Kodu yaz
+   - "Bu çözüm [neden] işe yarayacak"
+
+ÖRNEK DÜŞÜNME SÜRECİ:
+Kullanıcı: "WebSocket bağlantısı başarısız oluyor"
+Sen:
+"WebSocket bağlantısı başarısız. Önce backend loglarına bakalım:
+
+🔍 Backend'de şu hatayı görüyorum: 401 Unauthorized /api/generate/stream
+
+Aha! Sorun göründü: WebSocket endpoint'i JWT middleware içinde ve token query string'den alınmıyor.
+
+Çözüm: Endpoint'i middleware dışına taşımalıyız. Şöyle düzeltelim:
+` + "```go" + `
+// WebSocket endpoint (middleware dışında)
+r.GET(\"/api/generate/stream\", HandleGenerateStream)
+
+// Diğer API endpoint'leri (middleware içinde)
+api := r.Group(\"/api\")
+api.Use(AuthMiddleware())
+` + "```" + `
+
+Bu çözüm işe yarayacak çünkü WebSocket token'ı query string'den alıyor."
+
+DOSYA İŞLEMLERİ:
+Kullanıcı "dosya oluştur", "dosyaya ekle", "şunu değiştir", "bu satırı sil" gibi komutlar verdiğinde:
+
+1. Önce dosya var mı kontrol et (context files'da görebilirsin)
+2. Dosya VARSA:
+   - Mevcut içeriği oku
+   - İstenen değişiklikleri uygula
+   - Önce DIFF formatında değişiklikleri göster
+   - Sonra TAM güncel dosya içeriğini göster
+
+3. Dosya YOKSA:
+   - Direkt yeni dosya içeriğini kod bloğu olarak yaz
+   - Diff formatına gerek yok
+
+GELIŞMIŞ YETKİLER - TOOL KULLANIMI:
+Sen sadece kod yazan bir asistan değilsin. Aynı zamanda dosya sistemi, terminal ve git işlemlerini de yapabilirsin!
+
+KULLANILABILIR TOOL'LAR:
+
+1. DOSYA OKUMA:
+   Backend'den dosya içeriğini isteyebilirsin. Örnek:
+   "🔧 TOOL: Dosya okuma isteği - /path/to/file.py"
+
+2. DOSYA ARAMA:
+   Glob pattern ile dosya bul:
+   "🔧 TOOL: Dosya arama - pattern: **/*.test.js"
+
+3. İÇERİK ARAMA (GREP):
+   Dosyalarda text/regex ara:
+   "🔧 TOOL: Grep - dosya: app.py, pattern: 'def login'"
+
+4. SHELL KOMUTU:
+   Terminal komutları çalıştır:
+   "🔧 TOOL: Shell - komut: pytest tests/ -v"
+   "🔧 TOOL: Shell - komut: npm run build"
+
+5. GIT İŞLEMLERİ:
+   "🔧 TOOL: Git status"
+   "🔧 TOOL: Git diff"
+   "🔧 TOOL: Git commit -m 'fix: bug düzeltildi'"
+
+TOOL KULLANIM STRATEJİSİ:
+
+Kullanıcı hata bildirdiğinde veya debug istediğinde:
+1. Önce ilgili dosyayı OKU: "🔧 TOOL: Dosya okuma - app.py"
+2. Hata varsa çöz ve kodu yaz
+3. Test çalıştır: "🔧 TOOL: Shell - pytest tests/"
+4. Başarılıysa commit: "🔧 TOOL: Git commit -m 'fix: hata düzeltildi'"
+
+Kullanıcı "testi çalıştır" dediğinde:
+1. Test komutunu çalıştır: "🔧 TOOL: Shell - npm test"
+2. Hata varsa analiz et ve düzelt
+3. Tekrar test et
+4. Başarılı olana kadar devam et
+
+Kullanıcı "kod bul" dediğinde:
+1. İlk olarak dosya ara: "🔧 TOOL: Dosya arama - **/*login*"
+2. Bulamazsan içerik ara: "🔧 TOOL: Grep - pattern: 'login'"
+3. Bulduğun dosyayı oku ve analiz et
+
+NOT: Tool kullanımını her zaman "🔧 TOOL:" öneki ile başlat ki backend tanısın!`
+
+	if contextContent != "" {
+		systemPrompt += "\n\nContext files:\n" + contextContent
+	}
+
+	// Ollama streaming request
+	ollamaReqBody, _ := json.Marshal(map[string]interface{}{
+		"model":  "llama3:8b",
+		"system": systemPrompt,
+		"prompt": req.Prompt,
+		"stream": true, // STREAMING AKTIF!
+		"options": map[string]interface{}{
+			"temperature": 0.7,
+			"top_p":       0.9,
+		},
+	})
+
+	// Ollama'ya streaming request gönder
+	ollamaStartTime := time.Now()
+	resp, err := http.Post(OLLAMA_API_URL+"/api/generate", "application/json", bytes.NewBuffer(ollamaReqBody))
+	if err != nil {
+		log.Printf("❌ Ollama bağlantı hatası: %v", err)
+		codeGenerationFailure.Inc()
+		ws.WriteJSON(map[string]string{"error": "AI servisine bağlanılamadı"})
+		return
+	}
+	defer resp.Body.Close()
+
+	// Streaming yanıtı oku ve WebSocket üzerinden gönder
+	decoder := json.NewDecoder(resp.Body)
+	fullResponse := ""
+
+	for {
+		var chunk map[string]interface{}
+		if err := decoder.Decode(&chunk); err != nil {
+			if err == io.EOF {
+				break
+			}
+			log.Printf("❌ Chunk decode hatası: %v", err)
+			break
+		}
+
+		// Chunk'taki response parçasını al
+		if response, ok := chunk["response"].(string); ok {
+			fullResponse += response
+
+			// WebSocket üzerinden chunk'ı gönder
+			ws.WriteJSON(map[string]interface{}{
+				"type": "chunk",
+				"data": response,
+			})
+		}
+
+		// Son chunk mı kontrol et
+		if done, ok := chunk["done"].(bool); ok && done {
+			ollamaResponseDuration.Observe(time.Since(ollamaStartTime).Seconds())
+			break
+		}
+	}
+
+	// 🔧 TOOL EXECUTION: AI'nın yanıtındaki tool çağrılarını parse et ve çalıştır
+	if strings.Contains(fullResponse, "🔧 TOOL:") {
+		log.Printf("🔧 Tool çağrıları algılandı (streaming), parse ediliyor...")
+		fullResponse = parseAndExecuteTools(fullResponse, req.BasePath)
+
+		// Tool sonuçlarını WebSocket üzerinden gönder
+		ws.WriteJSON(map[string]interface{}{
+			"type": "tool_results",
+			"data": fullResponse,
+		})
+	}
+
+	// Tam yanıtı işle ve dosya oluştur
+	code, language, hasCode := extractCodeBlock(fullResponse)
+	var fileCreatedMsg string
+
+	if hasCode {
+		log.Printf("📝 Kod bloğu algılandı: language=%s, length=%d", language, len(code))
+
+		fileName := extractFileName(req.Prompt, language)
+		log.Printf("📂 Dosya adı: %s", fileName)
+
+		targetDir := "default"
+		if len(req.ContextFiles) > 0 {
+			targetDir = filepath.Dir(req.ContextFiles[0])
+		}
+
+		var targetPath string
+		if req.BasePath != "" {
+			targetPath = filepath.Join(req.BasePath, targetDir, fileName)
+		} else {
+			targetPath = filepath.Join(targetDir, fileName)
+		}
+
+		if err := writeCodeToFile(req.ContextFiles, fileName, code, req.BasePath); err != nil {
+			log.Printf("❌ Dosya yazma hatası (%s): %v", fileName, err)
+			fileCreatedMsg = "\n\n⚠️ Dosya oluşturulamadı: " + err.Error()
+			codeGenerationFailure.Inc()
+		} else {
+			log.Printf("✅ Dosya başarıyla oluşturuldu: %s", targetPath)
+			fileCreatedMsg = "\n\n✅ Dosya oluşturuldu: " + targetPath
+			filesCreatedTotal.Inc()
+			codeGenerationSuccess.Inc()
+		}
+	}
+
+	// Bot mesajını kaydet
+	botMessage := Message{
+		ChatID:    req.ChatID,
+		Sender:    "bot",
+		Text:      fullResponse + fileCreatedMsg,
+		Type:      detectMessageType(fullResponse),
+		CreatedAt: time.Now(),
+	}
+	if err := db.Create(&botMessage).Error; err != nil {
+		log.Printf("❌ Bot mesajı kaydedilirken hata: %v", err)
+	}
+
+	// Chat güncelle
+	db.Model(&chat).Update("updated_at", time.Now())
+
+	// Son mesaj gönder (completed)
+	ws.WriteJSON(map[string]interface{}{
+		"type":      "completed",
+		"message":   botMessage,
+		"fileInfo":  fileCreatedMsg,
 	})
 }
 
@@ -1386,6 +2294,9 @@ func main() {
 	r.POST("/register", HandleRegister)
 	r.POST("/login", HandleLogin)
 
+	// --- WebSocket Endpoint (Token query string'den alınır) ---
+	r.GET("/api/generate/stream", HandleGenerateStream)
+
 	// --- API Rotaları (Korumalı) ---
 	api := r.Group("/api")
 	api.Use(AuthMiddleware()) // Bu gruptaki her şey JWT token gerektirir
@@ -1398,6 +2309,7 @@ func main() {
 		api.GET("/chats", HandleGetChats)
 		api.GET("/chats/:id", HandleGetChat)
 		api.DELETE("/chats/:id", HandleDeleteChat)
+		api.PUT("/chats/:id/context", HandleUpdateChatContext)
 
 		// Mesaj oluşturma (Ollama ile)
 		api.POST("/generate", HandleGenerate)
@@ -1411,6 +2323,14 @@ func main() {
 			tools.POST("/fs/write", HandleFSWrite)   // Dosya yazma
 			tools.POST("/fs/delete", HandleFSDelete) // Dosya silme
 			tools.POST("/fs/move", HandleFSMove)     // Dosya taşıma/yeniden adlandırma
+			tools.POST("/fs/search", HandleFSSearch) // Glob pattern ile dosya arama
+			tools.POST("/fs/grep", HandleFSGrep)     // İçerik araması
+
+			// Shell operasyonları
+			tools.POST("/shell/exec", HandleShellExec) // Command execution
+
+			// Git operasyonları
+			tools.POST("/git/op", HandleGitOperation) // Git işlemleri
 		}
 	}
 
